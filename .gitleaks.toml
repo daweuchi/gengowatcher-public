@@ -1,0 +1,16 @@
+title = "gengowatcher"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "gengo-rss-feed-key"
+description = "Private Gengo RSS feed URL key"
+regex = '''rss/available_jobs/([0-9a-f]{32,})'''
+secretGroup = 1
+
+[[rules]]
+id = "gengo-session-cookie"
+description = "Gengo session cookie value"
+regex = '''(?i)(?:myG_myGSession_|user_session)["'\s]*[=:]\s*["']?([0-9a-f]{32,})'''
+secretGroup = 1

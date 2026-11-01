@@ -1,0 +1,676 @@
+//! Authenticated blocking client for GengoWatcher's local FastAPI service.
+
+use std::{
+    fmt,
+    net::IpAddr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use reqwest::{StatusCode, Url, blocking::Client};
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
+
+use crate::model::{
+    CommandRequest, CommandResponse, DashboardData, EventsResponse, JobsResponse, Stats,
+    TranslateListResponse, TranslateModelsResponse, TranslateRunDetail, TranslateRunSummary,
+    TranslateStartRequest, TranslateStartResponse, WatcherStatus,
+};
+
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(4);
+const ACTION_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiError {
+    message: String,
+}
+
+impl ApiError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+#[derive(Clone)]
+pub struct ApiClient {
+    client: Client,
+    base_url: String,
+    token: String,
+}
+
+impl fmt::Debug for ApiClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiClient")
+            .field("client", &self.client)
+            .field("base_url", &self.base_url)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ApiClient {
+    pub fn new(base_url: &str, token: &str) -> Result<Self, ApiError> {
+        if token.trim().is_empty() {
+            return Err(ApiError::new(
+                "GENGOWATCHER_API_TOKEN is empty; refusing unauthenticated startup",
+            ));
+        }
+        let mut url = Url::parse(base_url.trim())
+            .map_err(|error| ApiError::new(format!("invalid API URL: {error}")))?;
+        if url.scheme() != "http" {
+            return Err(ApiError::new(
+                "API URL must use the local GengoWatcher HTTP service",
+            ));
+        }
+        if url.username() != "" || url.password().is_some() {
+            return Err(ApiError::new("API URL must not contain credentials"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(ApiError::new(
+                "API URL must not contain a query string or fragment",
+            ));
+        }
+        if !is_loopback_host(url.host_str()) {
+            return Err(ApiError::new(
+                "API URL must use a localhost or loopback address",
+            ));
+        }
+        let path = url.path().trim_end_matches('/').to_owned();
+        url.set_path(&path);
+        let client = Client::builder()
+            .connect_timeout(SNAPSHOT_TIMEOUT)
+            .timeout(SNAPSHOT_TIMEOUT)
+            .build()
+            .map_err(|error| ApiError::new(format!("failed to build API client: {error}")))?;
+        Ok(Self {
+            client,
+            base_url: url.to_string().trim_end_matches('/').to_owned(),
+            token: token.trim().to_owned(),
+        })
+    }
+
+    pub fn fetch_snapshot(&self) -> Result<DashboardData, ApiError> {
+        let status = self.get::<WatcherStatus>("/api/status")?;
+        let jobs = self.get::<JobsResponse>("/api/jobs?limit=100&page=1")?;
+        let events = self.get::<EventsResponse>("/api/events?limit=100")?;
+        let stats = self.get::<Stats>("/api/stats")?;
+        Ok(DashboardData {
+            status,
+            jobs: jobs.jobs,
+            events: events.events,
+            stats,
+            fetched_at: unix_timestamp(),
+        })
+    }
+
+    pub fn command(&self, command: &str) -> Result<CommandResponse, ApiError> {
+        self.post_json("/api/commands", &CommandRequest { command, args: &[] })
+    }
+
+    pub fn accept_job(&self, job_id: &str) -> Result<CommandResponse, ApiError> {
+        if !is_safe_job_id(job_id) {
+            return Err(ApiError::new("job ID contains unsupported characters"));
+        }
+        self.post_json_with_timeout(
+            &format!("/api/jobs/{job_id}/accept"),
+            &Value::Null,
+            ACTION_TIMEOUT,
+        )
+    }
+
+    pub fn cancel_current_job(&self) -> Result<CommandResponse, ApiError> {
+        self.post_json_with_timeout("/api/jobs/cancel", &Value::Null, ACTION_TIMEOUT)
+    }
+
+    pub fn list_translate_runs(&self) -> Result<Vec<TranslateRunSummary>, ApiError> {
+        let response = self.get::<TranslateListResponse>("/api/translate")?;
+        Ok(response.runs)
+    }
+
+    pub fn get_translate_run(&self, run_id: &str) -> Result<TranslateRunDetail, ApiError> {
+        if !is_safe_run_id(run_id) {
+            return Err(ApiError::new(
+                "translate run ID contains unsupported characters",
+            ));
+        }
+        self.get::<TranslateRunDetail>(&format!("/api/translate/{run_id}"))
+    }
+
+    pub fn list_translate_models(&self) -> Result<Vec<String>, ApiError> {
+        let response = self.get::<TranslateModelsResponse>("/api/translate/models")?;
+        if response.models.is_empty() {
+            return Err(ApiError::new("translate models list was empty"));
+        }
+        Ok(response.models)
+    }
+
+    pub fn start_translate(
+        &self,
+        text: &str,
+        models: Option<Vec<String>>,
+        with_review: bool,
+    ) -> Result<String, ApiError> {
+        let body = TranslateStartRequest {
+            text: text.to_owned(),
+            models,
+            with_review,
+        };
+        let response = self.post_json_with_timeout::<TranslateStartResponse, _>(
+            "/api/translate",
+            &body,
+            ACTION_TIMEOUT,
+        )?;
+        if response.run_id.trim().is_empty() {
+            return Err(ApiError::new("translate submit returned an empty run ID"));
+        }
+        Ok(response.run_id)
+    }
+
+    fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
+        let response = self
+            .client
+            .get(self.endpoint(path))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|error| ApiError::new(format!("API request failed: {error}")))?;
+        decode_response(response)
+    }
+
+    fn post_json<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ApiError> {
+        self.post_json_with_timeout(path, body, SNAPSHOT_TIMEOUT)
+    }
+
+    fn post_json_with_timeout<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<T, ApiError> {
+        let response = self
+            .client
+            .post(self.endpoint(path))
+            .timeout(timeout)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .map_err(|error| ApiError::new(format!("API request failed: {error}")))?;
+        decode_response(response)
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+}
+
+fn decode_response<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+) -> Result<T, ApiError> {
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json::<T>()
+            .map_err(|error| ApiError::new(format!("invalid API response: {error}")));
+    }
+    let body = response.text().unwrap_or_default();
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("detail")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| status_label(status));
+    Err(ApiError::new(format!("API returned {status}: {detail}")))
+}
+
+fn status_label(status: StatusCode) -> String {
+    status
+        .canonical_reason()
+        .map_or_else(|| "request failed".into(), str::to_owned)
+}
+
+fn is_safe_job_id(job_id: &str) -> bool {
+    let mut characters = job_id.chars();
+    match characters.next() {
+        Some(first) if first.is_ascii_alphanumeric() => characters
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')),
+        _ => false,
+    }
+}
+
+fn is_safe_run_id(run_id: &str) -> bool {
+    if run_id.len() > 64 {
+        return false;
+    }
+    is_safe_job_id(run_id)
+}
+
+fn is_loopback_host(host: Option<&str>) -> bool {
+    match host {
+        Some("localhost") => true,
+        Some(value) => value
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        None => false,
+    }
+}
+
+fn unix_timestamp() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    #[test]
+    fn debug_output_redacts_bearer_token() {
+        let client =
+            ApiClient::new("http://127.0.0.1:8000", "distinct-secret-token").expect("valid client");
+        let output = format!("{client:?}");
+
+        assert!(!output.contains("distinct-secret-token"));
+        assert!(output.contains("<redacted>"));
+    }
+
+    #[test]
+    fn rejects_empty_tokens_and_insecure_remote_http() {
+        assert!(ApiClient::new("http://127.0.0.1:8000", "").is_err());
+        assert!(ApiClient::new("http://example.com", "token").is_err());
+        assert!(ApiClient::new("https://example.com", "token").is_err());
+    }
+
+    #[test]
+    fn accepts_ipv4_ipv6_and_named_loopback_urls() {
+        assert!(ApiClient::new("http://127.0.0.1:8000", "token").is_ok());
+        assert!(ApiClient::new("http://[::1]:8000", "token").is_ok());
+        assert!(ApiClient::new("http://localhost:8000", "token").is_ok());
+    }
+
+    #[test]
+    fn action_timeout_covers_default_accept_attempt() {
+        assert!(ACTION_TIMEOUT > SNAPSHOT_TIMEOUT);
+        assert!(ACTION_TIMEOUT >= Duration::from_secs(12).saturating_add(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn job_ids_are_restricted_before_becoming_url_paths() {
+        let client = ApiClient::new("http://127.0.0.1:9", "token").expect("valid client");
+        for job_id in ["../../config", "..", ".", "../", "-1", "_id", ""] {
+            let error = client.accept_job(job_id).expect_err("invalid ID");
+            assert_eq!(
+                error.to_string(),
+                "job ID contains unsupported characters",
+                "{job_id}"
+            );
+        }
+        assert!(is_safe_job_id("12345"));
+        assert!(is_safe_job_id("job-1"));
+        assert!(is_safe_job_id("job_1"));
+        assert!(!is_safe_job_id(".."));
+        assert!(!is_safe_job_id("."));
+    }
+
+    #[test]
+    fn translate_run_ids_are_restricted_before_becoming_url_paths() {
+        let client = ApiClient::new("http://127.0.0.1:9", "token").expect("valid client");
+        for run_id in ["../run", "..", ".", "", "-lead", "_lead"] {
+            let error = client.get_translate_run(run_id).expect_err("invalid ID");
+            assert_eq!(
+                error.to_string(),
+                "translate run ID contains unsupported characters",
+                "{run_id}"
+            );
+        }
+        assert!(is_safe_run_id("20260911-120000-a1b2c3d4"));
+        assert!(!is_safe_run_id(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn list_translate_runs_reads_bearer_authenticated_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = vec![0_u8; 8_192];
+            let bytes = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.starts_with("GET /api/translate HTTP/1.1"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
+            let body = r#"{"runs":[{"run_id":"20260911-120000-a1b2c3d4","kind":"text","char_count":42,"with_review":true,"models":["opencode"],"created_at":1000,"finished":true,"per_model":{"opencode":{"status":"ok"}},"input_preview":"hello"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let client =
+            ApiClient::new(&format!("http://{address}"), "test-token").expect("valid client");
+
+        let runs = client.list_translate_runs().expect("runs listed");
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, "20260911-120000-a1b2c3d4");
+        assert_eq!(runs[0].per_model["opencode"].status, "ok");
+        server.join().expect("test server joined");
+    }
+
+    #[test]
+    fn get_translate_run_decodes_detail_with_final_alias() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = vec![0_u8; 8_192];
+            let bytes = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.starts_with("GET /api/translate/20260911-120000-a1b2c3d4 HTTP/1.1"));
+            let body = r#"{"run_id":"20260911-120000-a1b2c3d4","source_text":"source","results":{"opencode":{"status":"ok","final":"done"}}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let client =
+            ApiClient::new(&format!("http://{address}"), "test-token").expect("valid client");
+
+        let detail = client
+            .get_translate_run("20260911-120000-a1b2c3d4")
+            .expect("detail fetched");
+
+        assert_eq!(detail.summary.run_id, "20260911-120000-a1b2c3d4");
+        assert_eq!(detail.results["opencode"].final_text, "done");
+        server.join().expect("test server joined");
+    }
+
+    #[test]
+    fn start_translate_posts_text_models_review_and_returns_run_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = vec![0_u8; 16_384];
+            let bytes = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.starts_with("POST /api/translate HTTP/1.1"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
+            let body = request.split("\r\n\r\n").nth(1).expect("request body");
+            let payload: Value = serde_json::from_str(body).expect("valid JSON body");
+            assert_eq!(payload["text"], "hello world");
+            assert_eq!(payload["models"], Value::from(vec!["opencode", "codex"]));
+            assert_eq!(payload["with_review"], Value::from(false));
+            let body = r#"{"run_id":"20260911-120000-a1b2c3d4"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let client =
+            ApiClient::new(&format!("http://{address}"), "test-token").expect("valid client");
+
+        let run_id = client
+            .start_translate(
+                "hello world",
+                Some(vec!["opencode".into(), "codex".into()]),
+                false,
+            )
+            .expect("run submitted");
+
+        assert_eq!(run_id, "20260911-120000-a1b2c3d4");
+        server.join().expect("test server joined");
+    }
+
+    #[test]
+    fn start_translate_omits_models_when_all_are_selected() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = vec![0_u8; 16_384];
+            let bytes = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            let body = request.split("\r\n\r\n").nth(1).expect("request body");
+            let payload: Value = serde_json::from_str(body).expect("valid JSON body");
+            assert!(payload.get("models").is_none(), "{payload}");
+            let body = r#"{"run_id":"20260911-120000-a1b2c3d4"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let client =
+            ApiClient::new(&format!("http://{address}"), "test-token").expect("valid client");
+
+        let run_id = client
+            .start_translate("hello", None, true)
+            .expect("run submitted");
+
+        assert_eq!(run_id, "20260911-120000-a1b2c3d4");
+        server.join().expect("test server joined");
+    }
+
+    fn serve_once(status: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test address");
+        let body = body.to_owned();
+        let status = status.to_owned();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = vec![0_u8; 8_192];
+            let bytes = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.starts_with("POST /api/translate HTTP/1.1"));
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .expect("write response");
+        });
+        format!("http://{address}")
+    }
+
+    #[test]
+    fn start_translate_surfaces_busy_detail_from_server() {
+        let base_url = serve_once(
+            "429 Too Many Requests",
+            r#"{"detail":"Too many active translate runs (3)"}"#,
+        );
+        let client = ApiClient::new(&base_url, "test-token").expect("valid client");
+
+        let error = client
+            .start_translate("hello", None, true)
+            .expect_err("busy rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "API returned 429 Too Many Requests: Too many active translate runs (3)"
+        );
+    }
+
+    #[test]
+    fn start_translate_rejects_empty_run_id() {
+        let base_url = serve_once("202 Accepted", "{}");
+        let client = ApiClient::new(&base_url, "test-token").expect("valid client");
+
+        let error = client
+            .start_translate("hello", None, true)
+            .expect_err("empty run ID rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "translate submit returned an empty run ID"
+        );
+    }
+
+    #[test]
+    fn list_translate_models_decodes_supported_names() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = vec![0_u8; 8_192];
+            let bytes = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.starts_with("GET /api/translate/models HTTP/1.1"));
+            let body = r#"{"models":["grok","opencode","codex","claude"]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let client =
+            ApiClient::new(&format!("http://{address}"), "test-token").expect("valid client");
+
+        let models = client.list_translate_models().expect("models listed");
+
+        assert_eq!(models, vec!["grok", "opencode", "codex", "claude"]);
+        server.join().expect("test server joined");
+    }
+
+    #[test]
+    fn fetch_snapshot_reads_all_dashboard_endpoints_with_bearer_auth() {
+        let responses = [
+            (
+                "/api/status",
+                r#"{"is_running":true,"is_paused":false,"websocket_status":"Live","rss_status":"Watching","next_check_time":2000,"session_stats":{"new_entries":3,"total_value":44.2,"uptime":90},"failure_count":0}"#,
+            ),
+            (
+                "/api/jobs?limit=100&page=1",
+                r#"{"jobs":[{"id":"42","title":"JA → EN","reward":12.5,"currency":"USD","url":"https://example.invalid/42","timestamp":1000,"source":"WebSocket"}],"pagination":{"page":1,"limit":100,"total":1,"pages":1}}"#,
+            ),
+            (
+                "/api/events?limit=100",
+                r#"{"events":[{"event_type":"job.visible","event_id":"event-1","timestamp":1000,"data":{"id":"42"}}]}"#,
+            ),
+            (
+                "/api/stats",
+                r#"{"total_jobs":1,"total_value":12.5,"average_reward":12.5,"jobs_by_source":{"WebSocket":1},"session_stats":{"new_entries":3,"total_value":44.2,"uptime":90},"uptime":90}"#,
+            ),
+        ];
+        let (base_url, server) = start_test_server(responses);
+        let client = ApiClient::new(&base_url, "test-token").expect("valid client");
+
+        let snapshot = client.fetch_snapshot().expect("snapshot fetched");
+
+        assert!(snapshot.status.is_running);
+        assert_eq!(snapshot.jobs[0].id, "42");
+        assert_eq!(snapshot.events[0].event_type, "job.visible");
+        assert_eq!(snapshot.stats.average_reward, 12.5);
+        server.join().expect("test server joined");
+    }
+
+    #[test]
+    fn command_posts_authenticated_json_and_decodes_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = vec![0_u8; 8_192];
+            let bytes = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..bytes]);
+            assert!(request.starts_with("POST /api/commands HTTP/1.1"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
+            assert!(request.contains(r#""command":"pause""#));
+            let body = r#"{"status":"success","message":"Watcher paused"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+        let client =
+            ApiClient::new(&format!("http://{address}"), "test-token").expect("valid client");
+
+        let response = client.command("pause").expect("command succeeds");
+
+        assert_eq!(response.status, "success");
+        assert_eq!(response.message, "Watcher paused");
+        server.join().expect("test server joined");
+    }
+
+    fn start_test_server<const N: usize>(
+        responses: [(&'static str, &'static str); N],
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test address");
+        let server = thread::spawn(move || {
+            for (expected_path, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = vec![0_u8; 8_192];
+                let bytes = stream.read(&mut request).expect("read request");
+                let request = String::from_utf8_lossy(&request[..bytes]);
+                let request_line = request.lines().next().unwrap_or_default();
+                assert!(
+                    request_line.contains(expected_path),
+                    "expected {expected_path:?} in {request_line:?}"
+                );
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-token")
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write response");
+            }
+        });
+        (format!("http://{address}"), server)
+    }
+}
